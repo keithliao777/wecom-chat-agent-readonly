@@ -148,7 +148,10 @@ class Index:
             if "sent_ms" in row:
                 row["sent_at"] = human(row.pop("sent_ms"))
             if "last_time" in row:
-                row["last_message_at"] = human(row.pop("last_time"))
+                # conversations.last_time is seconds, messages.sent_ms is
+                # milliseconds; normalise before formatting.
+                last = row.pop("last_time")
+                row["last_message_at"] = human(last * 1000 if last and last < 10**11 else last)
         return rows
 
     @staticmethod
@@ -241,7 +244,7 @@ def handle(request, index):
     method = request.get("method")
     if method == "initialize":
         result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
-                  "serverInfo": {"name": "wecom-chat-readonly", "version": "0.3.0"},
+                  "serverInfo": {"name": "wecom-chat-readonly", "version": "0.4.0"},
                   "instructions": "仅查询本机当前账号归档。先搜索，再查看上下文；涉及图片或文件时按消息 ID 调用附件工具。姓名未解析和附件缺失须如实说明。附件工具可能把已匹配缓存文件复制到本地归档，不会修改企微源数据。"}
     elif method == "ping":
         result = {}

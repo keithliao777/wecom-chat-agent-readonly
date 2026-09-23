@@ -84,6 +84,8 @@ Queries are paginated and capped at 100 records per call. A useful agent flow is
 
 - Message formats and database layouts are undocumented and can change between WeCom releases.
 - Some message types, names, group nicknames, and attachments may remain unresolved.
+- Non-text rows fall back to a readable label such as `[图片] shot.png` or `[文件] report.xlsx` (parse status `labeled`). The label locates the original message; it is not proof that the file was retrieved or parsed.
+- Direct chats and groups that have no local room info are labelled from resolved member names, for example `群(Ann、Ben、Cara)`. These are derived hints, not official group names.
 - A uniquely matched cached filename is useful evidence but does not replace manual verification for consequential decisions.
 - The collector covers only chat data visible to the signed-in local account. It is not an enterprise compliance archive.
 - Large-scale performance and completeness require validation against the target machine and WeCom client.

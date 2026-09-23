@@ -32,6 +32,25 @@ HEADER = b"SQLite format 3\0"
 PAGE_SIZE = 4096
 DB_NAMES = ("message.db", "session.db", "user.db")
 MEDIA_TYPES = {4: "mixed", 14: "image", 15: "file", 20: "file"}
+# Human-readable labels for message types whose payload is not plain text, used
+# only as a last resort so a non-text row is not stored as an empty body.
+TYPE_LABELS = {
+    4: "图文", 6: "文件", 8: "动图", 10: "邮件", 13: "收集表", 14: "图片", 15: "文件",
+    16: "文件", 20: "邮件", 22: "视频", 23: "视频", 29: "链接", 31: "小程序",
+    35: "视频号", 36: "视频号", 38: "OA通知", 40: "通话", 41: "文件", 69: "文档",
+    78: "文档", 80: "收集表", 82: "链接", 91: "系统提醒", 101: "微信图片",
+    102: "微信文件", 123: "图文", 132: "天气卡片", 141: "链接", 145: "链接",
+    146: "链接", 221: "接龙", 501: "通话", 503: "会议", 515: "日程", 516: "日程",
+    561: "微盘", 565: "微盘", 570: "微盘", 573: "微盘", 579: "微盘", 580: "微盘",
+    581: "微盘", 671: "审批", 673: "审批", 1001: "公告", 1002: "已读回执",
+    1005: "公告", 1006: "公告", 1011: "文档动态", 1018: "公告", 1022: "公告",
+    1023: "公告", 1027: "公告", 1051: "审批", 1052: "审批", 1055: "审批",
+    1073: "会议", 1988: "系统",
+}
+_LABEL_SKIP_PREFIXES = ("http://", "https://", "{", "*1*", "*JeQa", "wxwork://", "file://",
+                        "/var/", "/storage/", "s.197", "il_", "xx_", "wedrive://",
+                        "https//", "work.weixin.qq.com")
+_LABEL_HEX = re.compile(r"[0-9a-fA-F]{16,}")
 MEDIA_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic",
                     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
                     ".txt", ".csv", ".zip", ".rar", ".7z", ".mp3", ".wav",
@@ -329,6 +348,41 @@ def decode_strings(raw: bytes, depth: int = 0) -> list[str]:
     return found
 
 
+def content_label(value: object, content_type: int) -> str | None:
+    """Best-effort readable label for a non-text message.
+
+    Media, mail, OA, drive and approval rows carry no plain body. Instead of
+    storing an empty body we surface a short hint such as ``[文件] report.xlsx``
+    or ``[邮件] Alice: stock list``. The label is a locator, not a payload: it
+    never claims the attachment itself was retrieved.
+    """
+    try:
+        raw = bytes(value) if value is not None else None
+    except (TypeError, ValueError):
+        raw = None
+    if raw is None:
+        return None
+    cands = []
+    for leaf in decode_strings(raw):
+        text = leaf.strip()
+        if not 2 <= len(text) <= 200 or any(c in text for c in "\r\n\t"):
+            continue
+        if text.lower().startswith(_LABEL_SKIP_PREFIXES):
+            continue
+        if _LABEL_HEX.fullmatch(text):
+            continue
+        if sum(c.isprintable() for c in text) / len(text) < 0.9:
+            continue
+        cands.append(text)
+    name = TYPE_LABELS.get(content_type, "消息(%s)" % content_type)
+    if not cands:
+        return "[%s]" % name
+    cands.sort(key=lambda t: (sum("\u4e00" <= c <= "\u9fff" for c in t) > 0, min(len(t), 80),
+                              sum("\u4e00" <= c <= "\u9fff" for c in t)), reverse=True)
+    text = " / ".join(dict.fromkeys(cands[:2]))[:160]
+    return "[%s] %s" % (name, text)
+
+
 def body_of(value: object, content_type: int) -> tuple[str | None, str]:
     if value is None:
         return None, "empty"
@@ -356,6 +410,11 @@ def body_of(value: object, content_type: int) -> tuple[str | None, str]:
         chosen = max(leaves, key=len)
         if len(chosen) >= 2:
             return chosen, "protobuf_candidate"
+    # Plain-text types stay "unparsed" when nothing was decoded, so a real text
+    # message is never masked by a generic label.
+    label = None if content_type in (0, 1, 2) else content_label(raw, content_type)
+    if label:
+        return label, "labeled"
     return None, "unparsed"
 
 
@@ -430,12 +489,39 @@ def index_snapshot(clear_dir: Path, index_path: Path, account: str, account_root
                 if name:
                     target.execute("INSERT OR REPLACE INTO people VALUES(?,?,?)", (person_id, str(name), "user_table"))
                     counts["people"] += 1
+    def readable_name(cid: str, kind: str) -> str | None:
+        """Fallback label for conversations WeCom stores without a name.
+
+        Direct chats have no peer name in conversation_table (it lives in
+        user_table); some groups have no local room info at all. Nothing here
+        invents a name: unresolved IDs are labelled by resolved member names, or
+        left as-is.
+        """
+        if kind == "direct":
+            peers = [part for part in cid[2:].split("_") if part and part != account]
+            names = []
+            for part in peers:
+                row = target.execute("SELECT name FROM people WHERE id=?", (part,)).fetchone()
+                if row and row[0]:
+                    names.append(str(row[0]))
+            if names:
+                return "、".join(dict.fromkeys(names))
+            return "、".join(peers) if peers else None
+        if kind == "group":
+            rows = target.execute("""SELECT p.name, COUNT(*) c FROM messages m
+                JOIN people p ON p.id=m.sender_id
+                WHERE m.conversation_id=? AND COALESCE(p.name,'')<>''
+                GROUP BY p.name ORDER BY c DESC LIMIT 3""", (cid,)).fetchall()
+            if rows:
+                return "群(" + "、".join(str(row[0]) for row in rows) + ")"
+        return None
+
     with closing(sqlite3.connect(f"file:{(clear_dir / 'session.db').as_posix()}?mode=ro", uri=True)) as sessions:
         if {"id", "name"} <= table_columns(sessions, "conversation_table"):
             for row in sessions.execute("SELECT id,name,roomname_remark,last_message_time FROM conversation_table"):
                 cid = str(row[0])
-                name = row[2] or row[1]
-                target.execute("INSERT OR REPLACE INTO conversations VALUES(?,?,?,?)", (cid, name, {"R":"group","S":"direct","M":"wechat_contact","O":"app","Y":"system"}.get(cid[:1], "unknown"), row[3]))
+                kind = {"R":"group","S":"direct","M":"wechat_contact","O":"app","Y":"system"}.get(cid[:1], "unknown")
+                target.execute("INSERT OR REPLACE INTO conversations VALUES(?,?,?,?)", (cid, row[2] or row[1], kind, row[3]))
                 counts["conversations"] += 1
         if {"conversation_id", "user_id", "nick_name"} <= table_columns(sessions, "conversation_user_table"):
             for row in sessions.execute("SELECT conversation_id,user_id,nick_name FROM conversation_user_table WHERE nick_name IS NOT NULL"):
@@ -488,6 +574,11 @@ def index_snapshot(clear_dir: Path, index_path: Path, account: str, account_root
                 for name in media_candidates(content, int(kind or 0)):
                     target.execute("INSERT OR IGNORE INTO media_candidates VALUES(?,?,?)",
                                    (mid, name, MEDIA_TYPES[int(kind or 0)]))
+    # Naming needs both people and messages, so it runs after the message pass.
+    for cid, kind in target.execute("SELECT id,kind FROM conversations WHERE COALESCE(name,'')=''").fetchall():
+        name = readable_name(str(cid), str(kind or ""))
+        if name:
+            target.execute("UPDATE conversations SET name=? WHERE id=?", (name, cid))
     counts["media_files"] = catalog_media(target, account_root)
     target.execute("INSERT OR REPLACE INTO meta VALUES('last_collection_utc',?)", (datetime.now(timezone.utc).isoformat(),))
     target.execute("INSERT OR REPLACE INTO meta VALUES('account',?)", (account,))
