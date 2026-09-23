@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+config.json
+data/
+index.db*
+attachments/
+collection.log
+wecom-readonly-*/
+wecom-inspect-*/
+.idea/
+.vscode/
+
